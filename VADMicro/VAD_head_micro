@@ -1,0 +1,198 @@
+import copy
+from math import pi, cos, sin
+
+import torch
+import numpy as np
+import torch.nn as nn
+import matplotlib.pyplot as plt
+import torch.nn.functional as F
+from mmdet.models import HEADS, build_loss 
+from mmdet.models.dense_heads import DETRHead
+from mmdet.registry import MODELS
+
+
+from mmcv.utils import TORCH_VERSION, digit_version
+
+from mmdet.models.layers.transformer.utils import inverse_sigmoid  # TODO 待确认这个是否正确
+
+from mmcv.cnn import Linear, bias_init_with_prob, xavier_init
+
+
+from mmcv.cnn.bricks.transformer import build_transformer
+
+
+class MLP(nn.Module):
+    def __init__(self, in_channels, hidden_unit, verbose=False):
+        super(MLP, self).__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(in_channels, hidden_unit),
+            nn.LayerNorm(hidden_unit),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        x = self.mlp(x)
+        return x
+
+class LaneNet(nn.Module):
+    def __init__(self, in_channels, hidden_unit, num_subgraph_layers):
+        super(LaneNet, self).__init__()
+        self.num_subgraph_layers = num_subgraph_layers
+        self.layer_seq = nn.Sequential()
+        for i in range(num_subgraph_layers):
+            self.layer_seq.add_module(
+                f'lmlp_{i}', MLP(in_channels, hidden_unit))
+            in_channels = hidden_unit*2
+
+    def forward(self, pts_lane_feats):
+        '''
+            Extract lane_feature from vectorized lane representation
+
+        Args:
+            pts_lane_feats: [batch size, max_pnum, pts, D]
+
+        Returns:
+            inst_lane_feats: [batch size, max_pnum, D]
+        '''
+        x = pts_lane_feats
+        for name, layer in self.layer_seq.named_modules():
+            if isinstance(layer, MLP):
+                # x [bs,max_lane_num,9,dim]
+                x = layer(x)
+                x_max = torch.max(x, -2)[0]
+                x_max = x_max.unsqueeze(2).repeat(1, 1, x.shape[2], 1)
+                x = torch.cat([x, x_max], dim=-1)
+        x_max = torch.max(x, -2)[0]
+        return x_max
+
+
+@MODELS.register_module()
+class VADHeadMicro(DETRHead):
+    """简化版的VAD检测头."""
+    def __init__(self,
+                 *args,
+                 transformer=None,
+                 bev_h=30,
+                 bev_w=30,
+                 num_query=100,
+                 num_classes=10,
+                 embed_dims=256,
+                 num_reg_fcs=2,
+                 with_box_refine=False,
+                 as_two_stage=False,
+                 **kwargs):
+        self.bev_h = bev_h
+        self.bev_w = bev_w
+        self.num_query = num_query
+        self.num_classes = num_classes
+        self.embed_dims = embed_dims
+        self.num_reg_fcs = num_reg_fcs
+        self.with_box_refine = with_box_refine
+        self.as_two_stage = as_two_stage
+        
+        super().__init__(*args, **kwargs)
+        
+        # 构建transformer
+        if transformer is not None:
+            self.transformer = build_transformer(transformer)  # TODO 这个似乎不正确
+        
+    def _init_layers(self):
+        """初始化网络层."""
+        # 1. 初始化分类和回归分支
+        cls_branch = []
+        for _ in range(self.num_reg_fcs):
+            cls_branch.append(Linear(self.embed_dims, self.embed_dims))
+            cls_branch.append(nn.LayerNorm(self.embed_dims))
+            cls_branch.append(nn.ReLU(inplace=True))
+        cls_branch.append(Linear(self.embed_dims, self.num_classes))
+        cls_branch = nn.Sequential(*cls_branch)
+
+        reg_branch = []
+        for _ in range(self.num_reg_fcs):
+            reg_branch.append(Linear(self.embed_dims, self.embed_dims))
+            reg_branch.append(nn.ReLU())
+        reg_branch.append(Linear(self.embed_dims, 4))  # 4 for bbox
+        reg_branch = nn.Sequential(*reg_branch)
+
+        # 2. 初始化query embeddings
+        if not self.as_two_stage:
+            self.bev_embedding = nn.Embedding(
+                self.bev_h * self.bev_w, self.embed_dims)
+            self.query_embedding = nn.Embedding(self.num_query,
+                                              self.embed_dims * 2)
+
+        # 3. 创建多个分类和回归分支
+        num_pred = self.transformer.decoder.num_layers
+
+        def _get_clones(module, N):
+            return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
+        
+        if self.with_box_refine:
+            self.cls_branches = _get_clones(cls_branch, num_pred)
+            self.reg_branches = _get_clones(reg_branch, num_pred)
+        else:
+            self.cls_branches = nn.ModuleList(
+                [cls_branch for _ in range(num_pred)])
+            self.reg_branches = nn.ModuleList(
+                [reg_branch for _ in range(num_pred)])
+
+    def forward(self, mlvl_feats, img_metas, prev_bev=None):
+        """前向传播."""
+        batch_size = mlvl_feats[0].size(0)
+        
+        # 1. 准备query
+        bev_queries = self.bev_embedding.weight.unsqueeze(0).repeat(
+            batch_size, 1, 1)
+        object_query_embeds = self.query_embedding.weight.unsqueeze(0).repeat(
+            batch_size, 1, 1)
+
+        # 2. transformer处理
+        outputs = self.transformer(
+            mlvl_feats,
+            bev_queries,
+            object_query_embeds,
+            self.bev_h,
+            self.bev_w,
+            reg_branches=self.reg_branches if self.with_box_refine else None,
+            cls_branches=self.cls_branches if self.as_two_stage else None,
+            img_metas=img_metas,
+            prev_bev=prev_bev)
+
+        bev_embed, hs, init_reference, inter_references = outputs
+
+        # 3. 解码输出
+        outputs_classes = []
+        outputs_coords = []
+        
+        for lvl in range(hs.shape[0]):
+            reference = inter_references[lvl]
+            reference = inverse_sigmoid(reference)
+            outputs_class = self.cls_branches[lvl](hs[lvl])
+            tmp = self.reg_branches[lvl](hs[lvl])
+            
+            # 处理bbox预测
+            tmp = tmp + reference
+            outputs_coord = tmp.sigmoid()
+            outputs_classes.append(outputs_class)
+            outputs_coords.append(outputs_coord)
+
+        outputs_classes = torch.stack(outputs_classes)
+        outputs_coords = torch.stack(outputs_coords)
+        
+        return {
+            'bev_embed': bev_embed,
+            'all_cls_scores': outputs_classes,
+            'all_bbox_preds': outputs_coords,
+            'enc_cls_scores': None,
+            'enc_bbox_preds': None,
+        }
+
+    def loss(self, preds_dicts, gt_bboxes_list, gt_labels_list, img_metas):
+        """计算损失."""
+        # 实现基本的分类和回归损失计算
+        ...
+
+    def get_bboxes(self, preds_dicts, img_metas, rescale=False):
+        """后处理获取最终预测框."""
+        # 实现基本的后处理逻辑
+        ...

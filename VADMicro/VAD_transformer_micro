@@ -1,0 +1,160 @@
+import torch
+import torch.nn as nn
+from mmengine.model import BaseModule
+from mmcv.cnn.bricks.transformer import build_transformer_layer_sequence
+from torchvision.transforms.functional import rotate
+
+class VADPerceptionTransformerMicro(BaseModule):
+    """简化版的VAD Transformer."""
+    def __init__(self,
+                 encoder=None,
+                 decoder=None,
+                 embed_dims=256,
+                 num_feature_levels=1,
+                 num_cams=6,
+                 rotate_prev_bev=True,
+                 use_shift=True,
+                 use_can_bus=True,
+                 can_bus_norm=True,
+                 use_cams_embeds=True,
+                 rotate_center=[100, 100],
+                 **kwargs):
+        super(VADPerceptionTransformerMicro, self).__init__(**kwargs)
+        
+        self.encoder = build_transformer_layer_sequence(encoder)
+        self.decoder = build_transformer_layer_sequence(decoder) if decoder is not None else None
+        
+        self.embed_dims = embed_dims
+        self.num_feature_levels = num_feature_levels
+        self.num_cams = num_cams
+        
+        self.use_can_bus = use_can_bus
+        self.can_bus_norm = can_bus_norm
+        self.use_cams_embeds = use_cams_embeds
+        
+        self.init_layers()
+
+    def init_layers(self):
+        """初始化网络层."""
+        self.level_embeds = nn.Parameter(
+            torch.Tensor(self.num_feature_levels, self.embed_dims))
+        self.cams_embeds = nn.Parameter(
+            torch.Tensor(self.num_cams, self.embed_dims))
+        self.reference_points = nn.Linear(self.embed_dims, 2)
+        
+        self.can_bus_mlp = nn.Sequential(
+            nn.Linear(18, self.embed_dims),
+            nn.ReLU(inplace=True),
+            nn.LayerNorm(self.embed_dims) if self.can_bus_norm else nn.Identity()
+        )
+
+    def init_weights(self):
+        """初始化权重."""
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+        nn.init.normal_(self.level_embeds)
+        nn.init.normal_(self.cams_embeds)
+        nn.init.xavier_uniform_(self.reference_points.weight)
+        nn.init.zeros_(self.reference_points.bias)
+
+    def get_bev_features(self,
+                        mlvl_feats,
+                        bev_queries,
+                        bev_h,
+                        bev_w,
+                        bev_pos=None,
+                        prev_bev=None,
+                        **kwargs):
+        """简化的BEV特征提取."""
+        bs = mlvl_feats[0].size(0)
+        bev_queries = bev_queries.unsqueeze(1).repeat(1, bs, 1)
+
+        feat_flatten = []
+        spatial_shapes = []
+        
+        feat = mlvl_feats[0]
+        bs, num_cam, c, h, w = feat.shape
+        spatial_shape = (h, w)
+        feat = feat.flatten(3).permute(1, 0, 3, 2)
+        
+        if self.use_cams_embeds:
+            feat = feat + self.cams_embeds[:, None, None, :].to(feat.dtype)
+        feat = feat + self.level_embeds[None, None, 0:1, :].to(feat.dtype)
+        
+        spatial_shapes.append(spatial_shape)
+        feat_flatten.append(feat)
+
+        feat_flatten = torch.cat(feat_flatten, 2)
+        spatial_shapes = torch.as_tensor(
+            spatial_shapes, dtype=torch.long, device=feat.device)
+        level_start_index = torch.tensor([0], device=feat.device)
+
+        feat_flatten = feat_flatten.permute(0, 2, 1, 3)
+
+        if self.use_can_bus and 'img_metas' in kwargs:
+            can_bus = bev_queries.new_tensor(
+                [each['can_bus'] for each in kwargs['img_metas']])
+            can_bus = self.can_bus_mlp(can_bus)[None, :, :]
+            bev_queries = bev_queries + can_bus
+
+        bev_embed = self.encoder(
+            bev_queries,
+            feat_flatten,
+            feat_flatten,
+            spatial_shapes=spatial_shapes,
+            level_start_index=level_start_index,
+            prev_bev=prev_bev,
+            **kwargs)
+
+        return bev_embed
+
+    def forward(self,
+                mlvl_feats,
+                bev_queries,
+                object_query_embed,
+                bev_h,
+                bev_w,
+                reg_branches=None,
+                cls_branches=None,
+                prev_bev=None,
+                **kwargs):
+        """简化的前向传播."""
+        bev_embed = self.get_bev_features(
+            mlvl_feats,
+            bev_queries,
+            bev_h,
+            bev_w,
+            prev_bev=prev_bev,
+            **kwargs)
+
+        bs = mlvl_feats[0].size(0)
+        query_pos, query = torch.split(object_query_embed, self.embed_dims, dim=1)
+        query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
+        query = query.unsqueeze(0).expand(bs, -1, -1)
+        reference_points = self.reference_points(query_pos)
+        reference_points = reference_points.sigmoid()
+        init_reference_out = reference_points
+
+        query = query.permute(1, 0, 2)
+        query_pos = query_pos.permute(1, 0, 2)
+        bev_embed = bev_embed.permute(1, 0, 2)
+
+        if self.decoder is not None:
+            inter_states, inter_references = self.decoder(
+                query=query,
+                key=None,
+                value=bev_embed,
+                query_pos=query_pos,
+                reference_points=reference_points,
+                reg_branches=reg_branches,
+                cls_branches=cls_branches,
+                spatial_shapes=torch.tensor([[bev_h, bev_w]], device=query.device),
+                level_start_index=torch.tensor([0], device=query.device),
+                **kwargs)
+            inter_references_out = inter_references
+        else:
+            inter_states = query.unsqueeze(0)
+            inter_references_out = reference_points.unsqueeze(0)
+
+        return bev_embed, inter_states, init_reference_out, inter_references_out
